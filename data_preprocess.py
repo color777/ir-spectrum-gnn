@@ -4,15 +4,27 @@ import torch
 from torch_geometric.data import InMemoryDataset, Data
 from rdkit import Chem
 from tqdm import tqdm
+from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import joblib
-from utils import smooth_curve
+from utils import smooth_curve, save_pca_scaler  # ✅ 添加 save_pca_scaler
 
 class IRDataset(InMemoryDataset):
-    def __init__(self, csv_file, target_len=6800, normalize=True, crop_range=(500, 3800), use_smooth=False, clip_max=None):
+    def __init__(
+        self,
+        csv_file,
+        target_len=6800,
+        normalize=True,
+        pca_dim=None,
+        crop_range=(500, 3800),
+        use_smooth=False,
+        clip_max=None
+    ):
         super().__init__()
         self.data_list = []
         self.scaler = StandardScaler() if normalize else None
+        self.pca = PCA(n_components=pca_dim) if pca_dim else None
+        self.pca_dim = pca_dim
 
         df = pd.read_csv(csv_file)
         raw_spectra = []
@@ -42,7 +54,7 @@ class IRDataset(InMemoryDataset):
 
             if crop_range:
                 start, end = crop_range
-                if len(spec) < end:
+                if end > len(spec):
                     continue
                 spec = spec[start:end]
 
@@ -52,26 +64,32 @@ class IRDataset(InMemoryDataset):
             if use_smooth:
                 spec = smooth_curve(spec)
 
-            fp = spec[0:1000]
-            sum_fp = fp.sum()
-            if sum_fp > 0:
-                spec = spec / sum_fp
-
             raw_spectra.append(spec)
             self.data_list.append(Data(x=x, edge_index=edge_index))
 
-        assert all(len(s) == len(raw_spectra[0]) for s in raw_spectra), "❌ 存在光谱长度不一致！"
-
         raw_spectra = np.array(raw_spectra)
+
         if normalize:
             raw_spectra = self.scaler.fit_transform(raw_spectra)
             joblib.dump(self.scaler, "scaler.pkl")
+
+        if self.pca:
+            raw_spectra = self.pca.fit_transform(raw_spectra)
+            print(f"✅ PCA 降维至 {self.pca_dim} 维")
+            joblib.dump(self.pca, "pca_model.pkl")
 
         for i, data in enumerate(self.data_list):
             data.y = torch.tensor(raw_spectra[i], dtype=torch.float32)
 
         self.data, self.slices = self.collate(self.data_list)
         print(f"✅ 最终图样本数: {len(self.data_list)}")
+
+    def save_pca_and_scaler(self, pca_path="pca_model.pkl", scaler_path="scaler.pkl"):
+        if self.pca is not None and self.scaler is not None:
+            save_pca_scaler(self.pca, self.scaler, pca_path, scaler_path)
+            print("✅ 成功保存 PCA 和 Scaler")
+        else:
+            print("⚠️ 当前未启用 normalize 或 PCA，跳过保存。")
 
     @property
     def num_node_features(self):

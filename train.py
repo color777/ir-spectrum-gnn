@@ -1,31 +1,48 @@
 import torch
 from tqdm import tqdm
+import torch.nn.functional as F
 
-def train(model, train_loader, val_loader, optimizer, criterion, epochs, device, weight_decay=1e-5, patience=20):
-    best_val_loss = float('inf')
-    best_model_state = None
+class EarlyStopper:
+    def __init__(self, patience=20):
+        self.patience = patience
+        self.counter = 0
+        self.best_loss = float("inf")
+
+    def check(self, val_loss):
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.counter = 0
+            return False
+        else:
+            self.counter += 1
+            return self.counter >= self.patience
+
+def hybrid_loss_fn(pred, target, alpha=0.8):
+    mse_loss = F.mse_loss(pred, target)
+    cosine_loss = 1 - F.cosine_similarity(pred, target, dim=-1).mean()
+    return alpha * mse_loss + (1 - alpha) * cosine_loss
+
+def train(model, train_loader, val_loader, optimizer, criterion, epochs, device, weight_decay=1e-5):
+    best_val_loss = float("inf")
+    stopper = EarlyStopper(patience=20)
     train_losses = []
     val_losses = []
-    patience_counter = 0
 
-    for epoch in range(epochs):
+    for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
-        for batch in train_loader:
+        total_loss = 0
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}"):
             batch = batch.to(device)
             optimizer.zero_grad()
             output = model(batch)
+            target = batch.y.view(batch.num_graphs, -1).to(device)
 
-            y = batch.y
-            if y.ndim == 1:
-                y = y.view(output.shape)
+            loss = hybrid_loss_fn(output, target)
 
-            loss = criterion(output, y)
-
-            # ✅ 检查 NaN，跳过这个 batch
-            if torch.isnan(loss):
-                print("⚠️ 检测到 NaN loss，跳过该 batch")
-                continue
+            # L2 正则
+            l2_reg = sum(torch.norm(p) for p in model.parameters())
+            loss += weight_decay * l2_reg
 
             loss.backward()
             optimizer.step()
@@ -33,38 +50,30 @@ def train(model, train_loader, val_loader, optimizer, criterion, epochs, device,
 
         avg_train_loss = total_loss / len(train_loader)
         train_losses.append(avg_train_loss)
+        print(f"📈 Epoch {epoch}: Train Loss = {avg_train_loss:.6f}")
 
-        # 验证集评估
         model.eval()
-        total_val_loss = 0.0
+        val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(device)
                 output = model(batch)
-                y = batch.y
-                if y.ndim == 1:
-                    y = y.view(output.shape)
+                target = batch.y.view(batch.num_graphs, -1).to(device)
+                val_loss += hybrid_loss_fn(output, target).item()
 
-                val_loss = criterion(output, y)
-                if torch.isnan(val_loss):
-                    continue
-                total_val_loss += val_loss.item()
-
-        avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_loss = val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
-        print(f"📉 Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f} - Val Loss: {avg_val_loss:.4f}")
+        print(f"🔍 Epoch {epoch}: Val Loss = {avg_val_loss:.6f}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            best_model_state = model.state_dict()
-            patience_counter = 0
+            torch.save(model.state_dict(), "best_model.pth")
+            print(f"✅ 模型保存成功！当前最优 Val Loss: {best_val_loss:.6f}")
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"⛔ 提前停止训练于 epoch {epoch+1}")
-                break
+            print(f"⚠️ 验证集损失未提升（当前: {avg_val_loss:.6f}, 最佳: {best_val_loss:.6f}）")
 
-    if best_model_state:
-        model.load_state_dict(best_model_state)
+        if stopper.check(avg_val_loss):
+            print("⛔ 早停触发，训练提前终止。")
+            break
 
     return train_losses, val_losses
